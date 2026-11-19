@@ -2,6 +2,8 @@
 
 A Flask-based web application for managing laboratory plasmid collections. Stores plasmid records with sequence data in SQLite, supports file uploads for common molecular biology formats, and includes Nagoya Protocol compliance reference information.
 
+![Plasmid Library with demo entries](docs/screenshot.png)
+
 ## Features
 
 - Browse, search, and filter plasmid records with sortable columns
@@ -25,18 +27,22 @@ A Flask-based web application for managing laboratory plasmid collections. Store
 ## Setup
 
 ```bash
-pip install flask biopython schedule
+pip install -r requirements.txt
 python plasmid_server.py
 ```
 
+Or use `START_SERVER.sh` (macOS/Linux) or `START_SERVER.bat` (Windows), which install the requirements if Flask is missing and start the server.
+
 The server starts at `http://localhost:5001`. The admin panel is at `http://localhost:5001/admin`.
 
-Default admin password: `admin123` -- change this in `plasmid_server.py` (line 32) before any real deployment.
+Default admin password: `admin123` -- change this in `plasmid_server.py` (line 33) before any real deployment.
 
 ## File Structure
 
 ```
 plasmid_server.py       Main Flask application (single-file server with embedded templates)
+requirements.txt        Python dependencies
+START_SERVER.sh/.bat    Startup scripts for macOS/Linux and Windows
 nagoya-info.md          Nagoya Protocol reference material
 uploads/                Uploaded sequence and attachment files (created at runtime)
 backups/                Automatic database backups (created at runtime)

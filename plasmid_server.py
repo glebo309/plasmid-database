@@ -26,6 +26,7 @@ app.secret_key = os.urandom(24)  # Generate random secret key for sessions
 def after_request(response):
     response.headers.pop('X-Frame-Options', None)
     response.headers['Content-Security-Policy'] = "frame-ancestors *"
+    response.headers['Cache-Control'] = 'no-store'
     return response
 
 # Admin password (change this!)
@@ -58,16 +59,19 @@ def init_db():
                   antibiotic_resistance TEXT,
                   reference TEXT,
                   comment TEXT,
-                  files TEXT,
                   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                  modified_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+                  modified_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                  files TEXT,
+                  added_on TEXT,
+                  added_by TEXT)''')
     
-    # Add files column if it doesn't exist (for existing databases)
-    try:
-        c.execute('ALTER TABLE plasmids ADD COLUMN files TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    # Add columns missing from older databases
+    for column in ('files', 'added_on', 'added_by'):
+        try:
+            c.execute(f'ALTER TABLE plasmids ADD COLUMN {column} TEXT')
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     
     # Audit trail table - tracks ALL changes
     c.execute('''CREATE TABLE IF NOT EXISTS audit_log
@@ -126,677 +130,423 @@ HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Plasmid Library</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
-        .container { max-width: 1800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
-        .header { background: #2c3e50; color: white; padding: 20px 30px; display: flex; justify-content: space-between; align-items: center; }
-        .header h1 { font-size: 24px; font-weight: 500; }
-        .header-info { font-size: 13px; opacity: 0.9; margin-top: 5px; }
-        .btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; margin-left: 10px; }
-        .btn:hover { background: #2980b9; }
-        .btn-success { background: #27ae60; }
-        .btn-success:hover { background: #229954; }
-        .btn-warning { background: #f39c12; }
-        .btn-warning:hover { background: #e67e22; }
-        .content { padding: 30px; }
-        
-        .toolbar { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
-        .search-box { flex: 1; min-width: 300px; position: relative; }
-        .search-box input { width: 100%; padding: 10px 40px 10px 15px; border: 2px solid #ddd; border-radius: 4px; font-size: 14px; }
-        .search-box input:focus { outline: none; border-color: #3498db; }
-        .search-icon { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: #7f8c8d; }
-        .filter-group { display: flex; gap: 10px; align-items: center; }
-        .filter-select { padding: 10px; border: 2px solid #ddd; border-radius: 4px; font-size: 14px; background: white; cursor: pointer; }
-        .stats-bar { background: #ecf0f1; padding: 10px 15px; border-radius: 4px; font-size: 13px; color: #2c3e50; margin-bottom: 20px; }
-        
-        .table-wrapper { overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; table-layout: fixed; }
-        td { overflow: hidden; text-overflow: ellipsis; }
-        th { background: #34495e; color: white; padding: 12px; text-align: left; font-weight: 600; font-size: 13px; cursor: pointer; user-select: none; position: relative; white-space: nowrap; resize: horizontal; overflow: auto; }
-        th { position: relative; }
-        .resizer { position: absolute; top: 0; right: 0; width: 5px; cursor: col-resize; user-select: none; height: 100%; }
-        th:hover { background: #2c3e50; }
-        th.sortable::after { content: " ⇅"; opacity: 0.5; font-size: 11px; }
-        th.sort-asc::after { content: " ▲"; opacity: 1; }
-        th.sort-desc::after { content: " ▼"; opacity: 1; }
-        td { padding: 12px; border-bottom: 1px solid #ecf0f1; font-size: 13px; }
-        tbody tr:hover { background: #f8f9fa; }
-        tbody tr.hidden { display: none; }
-        
-        .id-col { width: 60px; font-weight: 600; color: #3498db; }
-        .name-col { min-width: 200px; font-weight: 500; }
-        .action-col { width: 100px; text-align: center; }
-        
-        .form-section { background: #f8f9fa; padding: 20px; border-radius: 4px; margin-bottom: 20px; display: none; border: 2px solid #3498db; }
-        .form-section.active { display: block; }
-        .form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
-        .form-group { margin-bottom: 15px; }
-        .form-group.full-width { grid-column: 1 / -1; }
-        .form-group label { display: block; margin-bottom: 5px; font-weight: 500; color: #2c3e50; font-size: 13px; }
-        .form-group input, .form-group textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
-        .form-group input:focus, .form-group textarea:focus { outline: none; border-color: #3498db; }
-        .form-group textarea { min-height: 80px; resize: vertical; }
-        .form-group input[readonly] { background: #ecf0f1; color: #7f8c8d; cursor: not-allowed; }
-        
-        .edit-btn { background: #f39c12; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-        .edit-btn:hover { background: #e67e22; }
-        .empty-state { text-align: center; padding: 60px; color: #7f8c8d; }
-        
-        .file-list { margin-top: 10px; }
-        .file-item { display: inline-block; margin: 5px; padding: 5px 10px; background: #e8f5e9; border-radius: 3px; font-size: 12px; }
-        .file-item a { color: #27ae60; text-decoration: none; }
-        .file-item a:hover { text-decoration: underline; }
-        
-        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
-        .modal.active { display: flex; align-items: center; justify-content: center; }
-        .modal-content { background: white; padding: 30px; border-radius: 8px; max-width: 800px; width: 90%; max-height: 90vh; overflow-y: auto; }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .modal-header h2 { color: #2c3e50; }
-        .close-btn { background: #e74c3c; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
-        .close-btn:hover { background: #c0392b; }
-        
-        .seq-btn { background: #8e44ad; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; margin: 2px; }
-        .seq-btn:hover { background: #7d3c98; }
-        .dl-btn { background: #34495e; color: white; border: none; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; margin: 2px; text-decoration: none; display: inline-block; }
-        .dl-btn:hover { background: #2c3e50; }
-        
-        #seqModal .modal-content { max-width: 1100px; }
-        .seq-viewer { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px; }
-        .seq-map { text-align: center; }
-        .seq-text-container { max-height: 400px; overflow-y: auto; background: #1e1e1e; border-radius: 6px; padding: 15px; }
-        .seq-text { font-family: 'Courier New', monospace; font-size: 12px; color: #d4d4d4; word-break: break-all; line-height: 1.6; white-space: pre-wrap; }
-        .seq-text .insert-highlight { background: rgba(231,76,60,0.3); color: #e74c3c; font-weight: bold; }
-        .seq-text .line-num { color: #666; margin-right: 10px; user-select: none; }
-        .feature-table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 12px; }
-        .feature-table th { background: #34495e; color: white; padding: 6px 10px; text-align: left; font-size: 11px; }
-        .feature-table td { padding: 6px 10px; border-bottom: 1px solid #eee; }
-        .feature-type { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; color: white; }
-        .seq-info { display: flex; gap: 20px; margin-bottom: 15px; flex-wrap: wrap; }
-        .seq-info-item { background: #f0f0f0; padding: 8px 14px; border-radius: 4px; font-size: 13px; }
-        .seq-info-item strong { color: #2c3e50; }
-        .seq-tabs { display: flex; gap: 5px; margin-bottom: 10px; }
-        .seq-tab { padding: 8px 16px; border: none; background: #ecf0f1; cursor: pointer; border-radius: 4px 4px 0 0; font-size: 13px; }
-        .seq-tab.active { background: #3498db; color: white; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plasmid Library</title>
+<style>
+:root { --fg: #1a1a1a; --fg2: #555; --fg3: #999; --bg: #fff; --bg2: #fafafa; --border: #e0e0e0; --accent: #2e7d4f; --accent-light: #eaf6ef; --danger: #c0392b; --mono: "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace; }
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html { font-size: 14px; }
+body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); line-height: 1.5; }
+
+/* top bar */
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: 8px 20px; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 0; z-index: 100; }
+.topbar h1 { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.topbar-actions { display: flex; gap: 6px; align-items: center; }
+
+/* buttons */
+.btn { display: inline-flex; align-items: center; gap: 4px; padding: 6px 14px; font-size: 12px; font-weight: 500; border: 1px solid var(--border); border-radius: 3px; background: var(--bg); color: var(--fg); cursor: pointer; text-decoration: none; white-space: nowrap; transition: background 0.1s; }
+.btn:hover { background: var(--bg2); }
+.btn-primary { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.btn-primary:hover { background: #333; }
+.btn-ghost { border-color: transparent; }
+.btn-ghost:hover { background: var(--bg2); }
+.btn-sm { padding: 3px 8px; font-size: 11px; }
+.btn-danger { color: var(--danger); border-color: var(--danger); }
+.btn-danger:hover { background: #fdf0ef; }
+
+/* content area */
+.content { padding: 10px 20px; }
+
+/* toolbar */
+.toolbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; align-items: center; }
+.search-input { flex: 1; min-width: 240px; padding: 6px 10px; font-size: 12px; border: 1px solid var(--border); border-radius: 3px; background: var(--bg); font-family: inherit; }
+.search-input:focus { outline: none; border-color: var(--accent); }
+.filter-select { padding: 6px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 3px; background: var(--bg); font-family: inherit; cursor: pointer; }
+.filter-select:focus { outline: none; border-color: var(--accent); }
+.stats { font-size: 10px; color: var(--fg3); margin-bottom: 6px; }
+
+/* add form */
+.form-panel { display: none; padding: 16px; margin-bottom: 16px; border: 1px solid var(--border); background: var(--bg2); }
+.form-panel.active { display: block; }
+.form-panel h3 { font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+.form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.form-group { margin-bottom: 8px; }
+.form-group.full-width { grid-column: 1 / -1; }
+.form-group label { display: block; font-size: 11px; font-weight: 600; color: var(--fg2); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+.form-group input, .form-group textarea { width: 100%; padding: 6px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 3px; font-family: inherit; background: var(--bg); }
+.form-group input:focus, .form-group textarea:focus { outline: none; border-color: var(--accent); }
+.form-group textarea { min-height: 60px; resize: vertical; }
+.form-group input[readonly] { background: var(--bg2); color: var(--fg3); }
+.form-group small { font-size: 11px; color: var(--fg3); }
+.form-actions { display: flex; gap: 6px; margin-top: 8px; }
+
+/* table */
+.table-wrap { }
+table { width: 100%; border-collapse: collapse; }
+th { padding: 5px 8px; text-align: left; font-size: 12px; font-weight: 600; color: var(--fg2); text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 2px solid var(--fg); cursor: pointer; user-select: none; white-space: nowrap; background: var(--bg); position: sticky; top: 42px; z-index: 10; }
+th:hover { color: var(--fg); }
+th.sort-asc::after { content: " \\2191"; }
+th.sort-desc::after { content: " \\2193"; }
+td { padding: 5px 8px; border-bottom: 1px solid var(--border); border-right: 1px solid #eee; font-size: 13px; vertical-align: top; }
+td:last-child { border-right: none; }
+tbody tr:hover { background: var(--accent-light); }
+tbody tr.expanded .col-narrow, tbody tr.expanded .col-comment, tbody tr.expanded .col-minor { white-space: normal; text-overflow: unset; word-break: break-word; }
+tbody tr.hidden { display: none; }
+.col-id { width: 40px; font-weight: 600; font-family: var(--mono); font-size: 10px; max-width: 40px; }
+.col-name { min-width: 120px; max-width: 220px; font-weight: 500; }
+.col-narrow { max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-comment { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-minor { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--fg2); }
+.col-action { width: 50px; text-align: center; max-width: 50px; }
+td.muted { color: var(--fg3); }
+
+/* file chips */
+td:has(.file-list) { white-space: normal; max-width: 200px; }
+.file-list { display: flex; flex-direction: column; gap: 2px; }
+.file-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; }
+.file-chip a { color: var(--accent); text-decoration: none; }
+.file-chip a:hover { text-decoration: underline; }
+.file-chip .actions { display: inline-flex; gap: 2px; }
+.file-chip .actions button, .file-chip .actions a { font-size: 10px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 2px; background: var(--bg); color: var(--fg2); cursor: pointer; text-decoration: none; display: inline-block; }
+.file-chip .actions button:hover, .file-chip .actions a:hover { background: var(--bg2); }
+
+/* modal */
+.modal { display: none; position: fixed; z-index: 1000; inset: 0; background: rgba(0,0,0,0.4); }
+.modal.active { display: flex; align-items: center; justify-content: center; }
+.modal-box { background: var(--bg); border: 1px solid var(--border); width: 90%; max-width: 720px; max-height: 90vh; overflow-y: auto; }
+.modal-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.modal-head h2 { font-size: 14px; font-weight: 600; }
+.modal-body { padding: 16px; }
+.modal-foot { display: flex; gap: 6px; padding: 12px 16px; border-top: 1px solid var(--border); }
+
+/* file items in edit modal */
+.file-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; margin: 2px; background: var(--bg2); border: 1px solid var(--border); font-size: 11px; }
+.file-tag a { color: var(--accent); text-decoration: none; }
+.file-tag .remove-btn { background: none; border: none; color: var(--fg3); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+.file-tag .remove-btn:hover { color: var(--danger); }
+
+/* sequence viewer modal */
+#seqModal .modal-box { max-width: 1000px; }
+.seq-info { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.seq-badge { padding: 4px 10px; background: var(--bg2); border: 1px solid var(--border); font-size: 11px; }
+.seq-badge.highlight { background: #fdf0ef; border-color: var(--danger); }
+.seq-tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.seq-tab { padding: 8px 16px; font-size: 12px; border: none; background: none; cursor: pointer; color: var(--fg2); border-bottom: 2px solid transparent; }
+.seq-tab:hover { color: var(--fg); }
+.seq-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
+.seq-map { text-align: center; min-height: 300px; }
+.seq-text-box { max-height: 400px; overflow-y: auto; background: #1c1c1c; padding: 12px; }
+.seq-text { font-family: var(--mono); font-size: 11px; color: #ccc; word-break: break-all; line-height: 1.6; white-space: pre-wrap; }
+.seq-text .insert-highlight { background: rgba(192,57,43,0.25); color: #e74c3c; font-weight: bold; }
+.seq-text .line-num { color: #666; margin-right: 8px; user-select: none; }
+.feature-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.feature-table th { padding: 6px 8px; text-align: left; font-size: 10px; font-weight: 600; color: var(--fg2); text-transform: uppercase; border-bottom: 2px solid var(--border); background: var(--bg); }
+.feature-table td { padding: 6px 8px; border-bottom: 1px solid #f0f0f0; }
+.feature-type { display: inline-block; padding: 1px 6px; font-size: 10px; font-weight: 600; color: #fff; border-radius: 2px; }
+.empty-state { text-align: center; padding: 60px; color: var(--fg3); }
+
+@media (max-width: 900px) {
+    .form-grid { grid-template-columns: 1fr; }
+    .toolbar { flex-direction: column; }
+    .search-input { min-width: 100%; }
+}
+</style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <div>
-                <h1>🧬 Plasmid Library</h1>
-            </div>
-            <div>
-                <button class="btn" onclick="location.reload()">↻ Refresh</button>
-                <button class="btn btn-warning" onclick="window.open('/export/html','_blank')">� Full Sequence Report</button>
-                <button class="btn" onclick="location.href='/admin'">🔐 Admin</button>
-                <button class="btn btn-success" onclick="toggleAddForm()">+ Add Entry</button>
-            </div>
-        </div>
+<div class="topbar">
+    <h1>Plasmid Library</h1>
+    <div class="topbar-actions">
+        <a href="/export/html" target="_blank" class="btn">Export</a>
+        <a href="/admin" class="btn">Admin</a>
+        <button class="btn btn-primary" onclick="toggleAddForm()">+ Add Entry</button>
+    </div>
+</div>
 
-        <div class="content">
-            <div class="form-section" id="addForm">
-                <h3>Add New Plasmid</h3>
-                <form onsubmit="addPlasmid(event)" enctype="multipart/form-data">
-                    <div class="form-grid">
-                        <div class="form-group">
-                            <label>ID (Auto-generated) *</label>
-                            <input type="number" id="nextIdField" name="number" readonly required>
-                        </div>
-                        <div class="form-group">
-                            <label>Name *</label>
-                            <input type="text" name="name" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Plasmid Backbone</label>
-                            <input type="text" name="plasmid_backbone">
-                        </div>
-                        <div class="form-group">
-                            <label>Inductor</label>
-                            <input type="text" name="inductor">
-                        </div>
-                        <div class="form-group">
-                            <label>Antibiotic Resistance</label>
-                            <input type="text" name="antibiotic_resistance">
-                        </div>
-                        <div class="form-group">
-                            <label>Reference</label>
-                            <input type="text" name="reference">
-                        </div>
-                        <div class="form-group">
-                            <label>Added By *</label>
-                            <input type="text" name="added_by" required placeholder="Your name">
-                        </div>
-                        <div class="form-group full-width">
-                            <label>Comment</label>
-                            <textarea name="comment"></textarea>
-                        </div>
-                        <div class="form-group full-width">
-                            <label>Sequence File (required: .gb, .seq, .fasta, .ape, .dna) *</label>
-                            <input type="file" name="files" multiple required id="addFileInput">
-                            <small style="color:#e74c3c;display:none" id="fileWarning">⚠️ At least one sequence file is required!</small>
-                        </div>
-                    </div>
-                    <button type="submit" class="btn btn-success">Save</button>
-                    <button type="button" class="btn" onclick="toggleAddForm()">Cancel</button>
-                </form>
+<div class="content">
+    <div class="form-panel" id="addForm">
+        <h3>Add New Plasmid</h3>
+        <form onsubmit="addPlasmid(event)" enctype="multipart/form-data">
+            <div class="form-grid">
+                <div class="form-group"><label>ID</label><input type="number" id="nextIdField" name="number" readonly required></div>
+                <div class="form-group"><label>Name *</label><input type="text" name="name" required></div>
+                <div class="form-group"><label>Plasmid Backbone</label><input type="text" name="plasmid_backbone"></div>
+                <div class="form-group"><label>Inductor</label><input type="text" name="inductor"></div>
+                <div class="form-group"><label>Antibiotic Resistance</label><input type="text" name="antibiotic_resistance"></div>
+                <div class="form-group"><label>Reference</label><input type="text" name="reference"></div>
+                <div class="form-group"><label>Added By *</label><input type="text" name="added_by" required placeholder="Your name"></div>
+                <div class="form-group full-width"><label>Comment</label><textarea name="comment"></textarea></div>
+                <div class="form-group full-width"><label>Sequence File</label><input type="file" name="files" multiple id="addFileInput"><small>Optional (.gb, .seq, .fasta, .ape, .dna)</small></div>
             </div>
-
-            <div class="toolbar">
-                <div class="search-box">
-                    <input type="text" id="searchInput" placeholder="🔍 Search across all fields..." onkeyup="filterTable()">
-                    <span class="search-icon">⌕</span>
-                </div>
-                <div class="filter-group">
-                    <select class="filter-select" id="backboneFilter" onchange="filterTable()">
-                        <option value="">All Backbones</option>
-                    </select>
-                    <select class="filter-select" id="resistanceFilter" onchange="filterTable()">
-                        <option value="">All Resistances</option>
-                    </select>
-                    <select class="filter-select" id="inductorFilter" onchange="filterTable()">
-                        <option value="">All Inductors</option>
-                    </select>
-                </div>
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">Save</button>
+                <button type="button" class="btn" onclick="toggleAddForm()">Cancel</button>
             </div>
-
-            <div class="stats-bar">
-                <span id="statsDisplay">Showing <strong id="visibleCount">0</strong> of <strong id="totalCount">0</strong> plasmids</span>
-            </div>
-
-            {% if plasmids %}
-            <div class="table-wrapper">
-                <table id="plasmidTable">
-                    <thead>
-                        <tr>
-                            <th class="sortable id-col" onclick="sortTable(0)">ID</th>
-                            <th class="sortable name-col" onclick="sortTable(1)">Name</th>
-                            <th class="sortable" onclick="sortTable(2)">Plasmid Backbone</th>
-                            <th class="sortable" onclick="sortTable(3)">Inductor</th>
-                            <th class="sortable" onclick="sortTable(4)">Antibiotic Resistance</th>
-                            <th class="sortable" onclick="sortTable(5)">Reference</th>
-                            <th class="sortable" onclick="sortTable(6)">Comment</th>
-                            <th class="sortable" onclick="sortTable(7)">Added By</th>
-                            <th>Files</th>
-                            <th class="action-col">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for p in plasmids %}
-                        <tr data-id="{{ p[2] or 0 }}" data-name="{{ p[1] }}" data-backbone="{{ p[3] or '' }}" data-inductor="{{ p[4] or '' }}" data-resistance="{{ p[5] or '' }}">
-                            <td class="id-col">{{ p[2] or '-' }}</td>
-                            <td class="name-col">{{ p[1] }}</td>
-                            <td>{{ p[3] or '-' }}</td>
-                            <td>{{ p[4] or '-' }}</td>
-                            <td>{{ p[5] or '-' }}</td>
-                            <td>{{ p[6] or '-' }}</td>
-                            <td>{{ p[7] or '-' }}</td>
-                            <td>{{ p[12] or '-' }}</td>
-                            <td>
-                                {% if p[10] %}
-                                    {% set files = p[10].split(',') %}
-                                    <div class="file-list">
-                                        {% for file in files %}
-                                            {% set fname = file.strip() %}
-                                            {% set display = fname.split('_', 3)[-1] if '_' in fname else fname %}
-                                            {% set ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else '' %}
-                                            <div class="file-item" style="display:block">
-                                                <span style="font-weight:500">📎 {{ display }}</span><br>
-                                                {% if ext in ['gb', 'gbk', 'ape', 'dna', 'fasta', 'seq'] %}
-                                                <button class="seq-btn" data-filename="{{ fname }}" onclick="viewSequence(this.dataset.filename)">🔬 View Sequence</button>
-                                                {% endif %}
-                                                <a class="dl-btn" href="/download/{{ fname }}" download>⬇ Download</a>
-                                            </div>
-                                        {% endfor %}
-                                    </div>
-                                {% endif %}
-                            </td>
-                            <td class="action-col">
-                                <button class="edit-btn" onclick='editPlasmid({{ p[0] }}, {{ p|tojson }})'>Edit</button>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-            {% else %}
-            <div class="empty-state">
-                <p>No plasmids yet. Click "Add Entry" to get started!</p>
-            </div>
-            {% endif %}
-        </div>
+        </form>
     </div>
 
-    <!-- Edit Modal -->
-    <div id="editModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Edit Plasmid</h2>
-                <button class="close-btn" onclick="closeEditModal()">Close</button>
-            </div>
-            <form onsubmit="updatePlasmid(event)" enctype="multipart/form-data">
-                <input type="hidden" id="edit_id" name="id">
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>ID (Cannot be changed) *</label>
-                        <input type="number" id="edit_number" name="number" readonly required>
-                    </div>
-                    <div class="form-group">
-                        <label>Name *</label>
-                        <input type="text" id="edit_name" name="name" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Plasmid Backbone</label>
-                        <input type="text" id="edit_plasmid_backbone" name="plasmid_backbone">
-                    </div>
-                    <div class="form-group">
-                        <label>Inductor</label>
-                        <input type="text" id="edit_inductor" name="inductor">
-                    </div>
-                    <div class="form-group">
-                        <label>Antibiotic Resistance</label>
-                        <input type="text" id="edit_antibiotic_resistance" name="antibiotic_resistance">
-                    </div>
-                    <div class="form-group">
-                        <label>Reference</label>
-                        <input type="text" id="edit_reference" name="reference">
-                    </div>
-                    <div class="form-group">
-                        <label>Added By *</label>
-                        <input type="text" id="edit_added_by" name="added_by" required>
-                    </div>
-                    <div class="form-group full-width">
-                        <label>Comment</label>
-                        <textarea id="edit_comment" name="comment"></textarea>
-                    </div>
-                    <div class="form-group full-width">
-                        <label>Current Files:</label>
-                        <div id="current_files"></div>
-                    </div>
-                    <div class="form-group full-width">
-                        <label>Add New Files</label>
-                        <input type="file" name="files" multiple>
-                    </div>
-                </div>
-                <button type="submit" class="btn btn-success">Save Changes</button>
-                <button type="button" class="btn" onclick="closeEditModal()">Cancel</button>
-            </form>
-        </div>
+    <div class="toolbar">
+        <input type="text" class="search-input" id="searchInput" placeholder="Search..." onkeyup="filterTable()">
+        <select class="filter-select" id="backboneFilter" onchange="filterTable()"><option value="">All Backbones</option></select>
+        <select class="filter-select" id="resistanceFilter" onchange="filterTable()"><option value="">All Resistances</option></select>
+        <select class="filter-select" id="inductorFilter" onchange="filterTable()"><option value="">All Inductors</option></select>
     </div>
 
-    <!-- Sequence Viewer Modal -->
-    <div id="seqModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2 id="seqModalTitle">🔬 Sequence Viewer</h2>
-                <div>
-                    <a id="seqDownloadBtn" class="dl-btn" style="font-size:14px;padding:8px 16px" download>⬇ Download File</a>
-                    <button class="close-btn" onclick="closeSeqModal()">Close</button>
-                </div>
+    <div class="stats"><span id="visibleCount">0</span> / <span id="totalCount">0</span> entries</div>
+
+    {% if plasmids %}
+    <div class="table-wrap">
+        <table id="plasmidTable">
+            <thead><tr>
+                <th class="col-id" onclick="sortTable(0)">ID</th>
+                <th class="col-name" onclick="sortTable(1)">Name</th>
+                <th onclick="sortTable(2)">Backbone</th>
+                <th onclick="sortTable(3)">Resistance</th>
+                <th onclick="sortTable(4)">Inductor</th>
+                <th>Files</th>
+                <th class="col-comment" onclick="sortTable(6)">Comment</th>
+                <th class="col-minor" onclick="sortTable(7)">Reference</th>
+                <th class="col-minor" onclick="sortTable(8)">Added By</th>
+                <th class="col-action"></th>
+            </tr></thead>
+            <tbody>
+            {% for p in plasmids %}
+            <tr data-id="{{ p[2] or 0 }}" data-name="{{ p[1] }}" data-backbone="{{ p[3] or '' }}" data-inductor="{{ p[4] or '' }}" data-resistance="{{ p[5] or '' }}">
+                <td class="col-id">{{ p[2] or '' }}</td>
+                <td class="col-name">{{ p[1] }}</td>
+                <td{% if not p[3] %} class="muted"{% endif %} title="{{ p[3] or '' }}">{{ p[3] or '-' }}</td>
+                <td{% if not p[5] %} class="muted"{% endif %} title="{{ p[5] or '' }}">{{ p[5] or '-' }}</td>
+                <td class="col-narrow"{% if not p[4] %} style="color:var(--fg3)"{% endif %} title="{{ p[4] or '' }}">{{ p[4] or '-' }}</td>
+                <td>{% if p[10] %}{% set files = p[10].split(',') %}<div class="file-list">{% for file in files %}{% set fname = file.strip() %}{% set display = fname.split('_', 3)[-1] if '_' in fname else fname %}{% set ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else '' %}<div class="file-chip"><a href="/download/{{ fname }}" download title="{{ display }}">{{ display }}</a><span class="actions">{% if ext in ['gb', 'gbk', 'ape', 'dna', 'fasta', 'seq'] %}<button data-filename="{{ fname }}" onclick="viewSequence(this.dataset.filename)">View</button>{% endif %}</span></div>{% endfor %}</div>{% endif %}</td>
+                <td class="col-comment"{% if not p[7] %} style="color:var(--fg3)"{% endif %} title="{{ p[7] or '' }}">{{ p[7] or '-' }}</td>
+                <td class="col-minor"{% if not p[6] %} style="color:var(--fg3)"{% endif %} title="{{ p[6] or '' }}">{{ p[6] or '-' }}</td>
+                <td class="col-minor"{% if not p[12] %} style="color:var(--fg3)"{% endif %} title="{{ p[12] or '' }}">{{ p[12] or '-' }}</td>
+                <td class="col-action"><button class="btn btn-sm btn-ghost" onclick='editPlasmid({{ p[0] }}, {{ p|tojson }})'>Edit</button></td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state"><p>No entries yet.</p></div>
+    {% endif %}
+</div>
+
+<div id="editModal" class="modal">
+    <div class="modal-box">
+        <div class="modal-head"><h2>Edit Plasmid</h2><button class="btn btn-sm" onclick="closeEditModal()">Close</button></div>
+        <form onsubmit="updatePlasmid(event)" enctype="multipart/form-data">
+        <div class="modal-body">
+            <input type="hidden" id="edit_id" name="id">
+            <div class="form-grid">
+                <div class="form-group"><label>ID</label><input type="number" id="edit_number" name="number" readonly required></div>
+                <div class="form-group"><label>Name *</label><input type="text" id="edit_name" name="name" required></div>
+                <div class="form-group"><label>Plasmid Backbone</label><input type="text" id="edit_plasmid_backbone" name="plasmid_backbone"></div>
+                <div class="form-group"><label>Inductor</label><input type="text" id="edit_inductor" name="inductor"></div>
+                <div class="form-group"><label>Antibiotic Resistance</label><input type="text" id="edit_antibiotic_resistance" name="antibiotic_resistance"></div>
+                <div class="form-group"><label>Reference</label><input type="text" id="edit_reference" name="reference"></div>
+                <div class="form-group"><label>Added By</label><input type="text" id="edit_added_by" name="added_by"></div>
+                <div class="form-group full-width"><label>Comment</label><textarea id="edit_comment" name="comment"></textarea></div>
+                <div class="form-group full-width"><label>Files</label><div id="current_files"></div></div>
+                <div class="form-group full-width"><label>Add Files</label><input type="file" name="files" multiple></div>
             </div>
+        </div>
+        <div class="modal-foot">
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+            <button type="button" class="btn" onclick="closeEditModal()">Cancel</button>
+        </div>
+        </form>
+    </div>
+</div>
+
+<div id="seqModal" class="modal">
+    <div class="modal-box">
+        <div class="modal-head">
+            <h2 id="seqModalTitle">Sequence Viewer</h2>
+            <div style="display:flex;gap:6px"><a id="seqDownloadBtn" class="btn btn-sm" download>Download</a><button class="btn btn-sm" onclick="closeSeqModal()">Close</button></div>
+        </div>
+        <div class="modal-body">
             <div class="seq-info" id="seqInfo"></div>
             <div class="seq-tabs">
-                <button class="seq-tab active" onclick="showSeqTab('map', event)">🗺 Plasmid Map</button>
-                <button class="seq-tab" onclick="showSeqTab('sequence', event)">🧬 Sequence</button>
-                <button class="seq-tab" onclick="showSeqTab('features', event)">📋 Features</button>
+                <button class="seq-tab active" onclick="showSeqTab('map', event)">Map</button>
+                <button class="seq-tab" onclick="showSeqTab('sequence', event)">Sequence</button>
+                <button class="seq-tab" onclick="showSeqTab('features', event)">Features</button>
             </div>
-            <div id="seqTabMap" class="seq-tab-content">
-                <div id="seqMapContainer" class="seq-map" style="min-height:300px">
-                    <p style="color:#999;padding:40px">Loading plasmid map...</p>
-                </div>
-            </div>
-            <div id="seqTabSequence" class="seq-tab-content" style="display:none">
-                <div class="seq-text-container" id="seqTextContainer">
-                    <div class="seq-text" id="seqText">Loading sequence...</div>
-                </div>
-            </div>
-            <div id="seqTabFeatures" class="seq-tab-content" style="display:none">
-                <div id="seqFeaturesContainer">Loading features...</div>
-            </div>
+            <div id="seqTabMap" class="seq-tab-content"><div id="seqMapContainer" class="seq-map"><p style="color:var(--fg3);padding:40px">Loading...</p></div></div>
+            <div id="seqTabSequence" class="seq-tab-content" style="display:none"><div class="seq-text-box" id="seqTextContainer"><div class="seq-text" id="seqText">Loading...</div></div></div>
+            <div id="seqTabFeatures" class="seq-tab-content" style="display:none"><div id="seqFeaturesContainer">Loading...</div></div>
         </div>
     </div>
+</div>
 
-    <script>
-        let sortDirection = {};
+<script>
+let sortDirection = {};
+window.onload = function() {
+    populateFilters(); updateStats();
+    document.querySelectorAll('#plasmidTable tbody tr').forEach(row => {
+        row.addEventListener('click', function(e) {
+            if (e.target.closest('button, a, input')) return;
+            this.classList.toggle('expanded');
+        });
+    });
+};
 
-        window.onload = function() {
-            populateFilters();
-            updateStats();
-            makeColumnsResizable();
-        };
+async function toggleAddForm() {
+    const form = document.getElementById('addForm');
+    const isActive = form.classList.toggle('active');
+    if (isActive) {
+        const r = await fetch('/api/next-id');
+        const d = await r.json();
+        document.getElementById('nextIdField').value = d.next_id;
+    }
+}
 
-        function makeColumnsResizable() {
-            const table = document.getElementById('plasmidTable');
-            if (!table) return;
-            
-            const cols = table.querySelectorAll('th');
-            cols.forEach((col, index) => {
-                const resizer = document.createElement('div');
-                resizer.classList.add('resizer');
-                col.appendChild(resizer);
-                
-                let startX, startWidth;
-                
-                resizer.addEventListener('mousedown', function(e) {
-                    e.stopPropagation();
-                    startX = e.pageX;
-                    startWidth = col.offsetWidth;
-                    
-                    document.addEventListener('mousemove', doDrag);
-                    document.addEventListener('mouseup', stopDrag);
-                });
-                
-                function doDrag(e) {
-                    const width = startWidth + (e.pageX - startX);
-                    if (width > 50) {
-                        col.style.width = width + 'px';
-                    }
-                }
-                
-                function stopDrag() {
-                    document.removeEventListener('mousemove', doDrag);
-                    document.removeEventListener('mouseup', stopDrag);
-                }
-            });
-        }
+function populateFilters() {
+    const rows = document.querySelectorAll('#plasmidTable tbody tr');
+    const sets = { backbone: new Set(), resistance: new Set(), inductor: new Set() };
+    rows.forEach(r => {
+        ['backbone','resistance','inductor'].forEach(k => { const v = r.dataset[k]; if (v && v !== '-') sets[k].add(v); });
+    });
+    populateSelect('backboneFilter', Array.from(sets.backbone).sort());
+    populateSelect('resistanceFilter', Array.from(sets.resistance).sort());
+    populateSelect('inductorFilter', Array.from(sets.inductor).sort());
+}
+function populateSelect(id, values) {
+    const sel = document.getElementById(id);
+    const cur = sel.value;
+    const label = id.replace('Filter','').replace(/([A-Z])/g,' $1');
+    sel.innerHTML = '<option value="">All ' + label + 's</option>';
+    values.forEach(v => { const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); });
+    sel.value = cur;
+}
 
-        async function toggleAddForm() {
-            const form = document.getElementById('addForm');
-            const isActive = form.classList.toggle('active');
-            
-            if (isActive) {
-                const response = await fetch('/api/next-id');
-                const data = await response.json();
-                document.getElementById('nextIdField').value = data.next_id;
-            }
-        }
+function filterTable() {
+    const q = document.getElementById('searchInput').value.toLowerCase();
+    const bf = document.getElementById('backboneFilter').value;
+    const rf = document.getElementById('resistanceFilter').value;
+    const inf = document.getElementById('inductorFilter').value;
+    let vis = 0;
+    document.querySelectorAll('#plasmidTable tbody tr').forEach(row => {
+        const ok = row.textContent.toLowerCase().includes(q) && (!bf || row.dataset.backbone === bf) && (!rf || row.dataset.resistance === rf) && (!inf || row.dataset.inductor === inf);
+        row.classList.toggle('hidden', !ok);
+        if (ok) vis++;
+    });
+    updateStats(vis);
+}
+function updateStats(v) {
+    const t = document.querySelectorAll('#plasmidTable tbody tr').length;
+    document.getElementById('totalCount').textContent = t;
+    document.getElementById('visibleCount').textContent = v !== undefined ? v : t;
+}
+function sortTable(col) {
+    const table = document.getElementById('plasmidTable');
+    const tbody = table.querySelector('tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    const dir = (sortDirection[col] || 'asc') === 'asc' ? 'desc' : 'asc';
+    sortDirection = { [col]: dir };
+    table.querySelectorAll('th').forEach((h,i) => { h.classList.remove('sort-asc','sort-desc'); if (i===col) h.classList.add('sort-'+dir); });
+    rows.sort((a,b) => {
+        let av = a.cells[col].textContent.trim(), bv = b.cells[col].textContent.trim();
+        if (av==='-') av=''; if (bv==='-') bv='';
+        const an=parseFloat(av), bn=parseFloat(bv);
+        if (!isNaN(an)&&!isNaN(bn)) return dir==='asc'?an-bn:bn-an;
+        return dir==='asc'?av.localeCompare(bv):bv.localeCompare(av);
+    });
+    rows.forEach(r => tbody.appendChild(r));
+}
 
-        function populateFilters() {
-            const rows = document.querySelectorAll('#plasmidTable tbody tr');
-            const backbones = new Set();
-            const resistances = new Set();
-            const inductors = new Set();
+async function addPlasmid(e) {
+    e.preventDefault();
+    const r = await fetch('/api/plasmids', {method:'POST', body: new FormData(e.target)});
+    if (r.ok) location.reload(); else { const d = await r.json().catch(()=>({})); alert(d.error||'Error'); }
+}
+function editPlasmid(id, data) {
+    document.getElementById('edit_id').value = id;
+    document.getElementById('edit_number').value = data[2]||'';
+    document.getElementById('edit_name').value = data[1]||'';
+    document.getElementById('edit_plasmid_backbone').value = data[3]||'';
+    document.getElementById('edit_inductor').value = data[4]||'';
+    document.getElementById('edit_antibiotic_resistance').value = data[5]||'';
+    document.getElementById('edit_reference').value = data[6]||'';
+    document.getElementById('edit_comment').value = data[7]||'';
+    document.getElementById('edit_added_by').value = data[12]||'';
+    window._editId = id;
+    const fd = document.getElementById('current_files');
+    if (data[10]) {
+        fd.innerHTML = data[10].split(',').map(f => {
+            const dn = f.includes('_')?f.split('_').slice(3).join('_'):f;
+            const safe = f.replace(/[^a-zA-Z0-9]/g,'_');
+            return '<span class="file-tag" id="file-'+safe+'"><a href="/download/'+f+'" download>'+dn+'</a><button type="button" class="remove-btn" data-fn="'+f+'">&times;</button></span>';
+        }).join('');
+        fd.querySelectorAll('.remove-btn').forEach(b => b.onclick = function(){ removeFile(this.dataset.fn); });
+    } else { fd.innerHTML = '<span style="color:var(--fg3);font-size:11px">No files attached</span>'; }
+    document.getElementById('editModal').classList.add('active');
+}
+function closeEditModal() { document.getElementById('editModal').classList.remove('active'); }
+async function removeFile(fn) {
+    if (!confirm('Remove this file?')) return;
+    const r = await fetch('/api/plasmids/'+window._editId+'/remove-file', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})});
+    if (r.ok) {
+        const el = document.getElementById('file-'+fn.replace(/[^a-zA-Z0-9]/g,'_'));
+        if (el) el.remove();
+        const fd = document.getElementById('current_files');
+        if (!fd.querySelector('.file-tag')) fd.innerHTML = '<span style="color:var(--fg3);font-size:11px">No files attached</span>';
+    } else { alert('Error'); }
+}
+async function updatePlasmid(e) {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const r = await fetch('/api/plasmids/'+fd.get('id'), {method:'PUT',body:fd});
+    if (r.ok) location.reload(); else { const d = await r.json().catch(()=>({})); alert(d.error||'Error'); }
+}
 
-            rows.forEach(row => {
-                const backbone = row.dataset.backbone;
-                const resistance = row.dataset.resistance;
-                const inductor = row.dataset.inductor;
-                if (backbone && backbone !== '-') backbones.add(backbone);
-                if (resistance && resistance !== '-') resistances.add(resistance);
-                if (inductor && inductor !== '-') inductors.add(inductor);
-            });
-
-            populateSelect('backboneFilter', Array.from(backbones).sort());
-            populateSelect('resistanceFilter', Array.from(resistances).sort());
-            populateSelect('inductorFilter', Array.from(inductors).sort());
-        }
-
-        function populateSelect(id, values) {
-            const select = document.getElementById(id);
-            const currentValue = select.value;
-            select.innerHTML = '<option value="">All ' + id.replace('Filter', '').replace(/([A-Z])/g, ' $1') + 's</option>';
-            values.forEach(val => {
-                const option = document.createElement('option');
-                option.value = val;
-                option.textContent = val;
-                select.appendChild(option);
-            });
-            select.value = currentValue;
-        }
-
-        function filterTable() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            const backboneFilter = document.getElementById('backboneFilter').value;
-            const resistanceFilter = document.getElementById('resistanceFilter').value;
-            const inductorFilter = document.getElementById('inductorFilter').value;
-            
-            const rows = document.querySelectorAll('#plasmidTable tbody tr');
-            let visibleCount = 0;
-
-            rows.forEach(row => {
-                const text = row.textContent.toLowerCase();
-                const backbone = row.dataset.backbone;
-                const resistance = row.dataset.resistance;
-                const inductor = row.dataset.inductor;
-
-                const matchesSearch = text.includes(searchTerm);
-                const matchesBackbone = !backboneFilter || backbone === backboneFilter;
-                const matchesResistance = !resistanceFilter || resistance === resistanceFilter;
-                const matchesInductor = !inductorFilter || inductor === inductorFilter;
-
-                if (matchesSearch && matchesBackbone && matchesResistance && matchesInductor) {
-                    row.classList.remove('hidden');
-                    visibleCount++;
-                } else {
-                    row.classList.add('hidden');
-                }
-            });
-
-            updateStats(visibleCount);
-        }
-
-        function updateStats(visible) {
-            const total = document.querySelectorAll('#plasmidTable tbody tr').length;
-            const visibleCount = visible !== undefined ? visible : total;
-            document.getElementById('totalCount').textContent = total;
-            document.getElementById('visibleCount').textContent = visibleCount;
-        }
-
-        function sortTable(columnIndex) {
-            const table = document.getElementById('plasmidTable');
-            const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.querySelectorAll('tr'));
-            const headers = table.querySelectorAll('th');
-            
-            const currentDirection = sortDirection[columnIndex] || 'asc';
-            const newDirection = currentDirection === 'asc' ? 'desc' : 'asc';
-            sortDirection = { [columnIndex]: newDirection };
-
-            headers.forEach((h, i) => {
-                h.classList.remove('sort-asc', 'sort-desc');
-                if (i === columnIndex) {
-                    h.classList.add('sort-' + newDirection);
-                }
-            });
-
-            rows.sort((a, b) => {
-                let aVal = a.cells[columnIndex].textContent.trim();
-                let bVal = b.cells[columnIndex].textContent.trim();
-
-                if (aVal === '-') aVal = '';
-                if (bVal === '-') bVal = '';
-
-                const aNum = parseFloat(aVal);
-                const bNum = parseFloat(bVal);
-                
-                if (!isNaN(aNum) && !isNaN(bNum)) {
-                    return newDirection === 'asc' ? aNum - bNum : bNum - aNum;
-                }
-
-                return newDirection === 'asc' 
-                    ? aVal.localeCompare(bVal)
-                    : bVal.localeCompare(aVal);
-            });
-
-            rows.forEach(row => tbody.appendChild(row));
-        }
-
-        async function addPlasmid(event) {
-            event.preventDefault();
-            const formData = new FormData(event.target);
-
-            const response = await fetch('/api/plasmids', {
-                method: 'POST',
-                body: formData
-            });
-
-            if (response.ok) {
-                location.reload();
-            } else {
-                const data = await response.json().catch(() => ({}));
-                alert(data.error || 'Error adding plasmid');
-            }
-        }
-
-        function editPlasmid(id, data) {
-            document.getElementById('edit_id').value = id;
-            document.getElementById('edit_number').value = data[2] || '';
-            document.getElementById('edit_name').value = data[1] || '';
-            document.getElementById('edit_plasmid_backbone').value = data[3] || '';
-            document.getElementById('edit_inductor').value = data[4] || '';
-            document.getElementById('edit_antibiotic_resistance').value = data[5] || '';
-            document.getElementById('edit_reference').value = data[6] || '';
-            document.getElementById('edit_comment').value = data[7] || '';
-            document.getElementById('edit_added_by').value = data[12] || '';
-            
-            // Show current files
-            const filesDiv = document.getElementById('current_files');
-            if (data[10]) {
-                const files = data[10].split(',');
-                filesDiv.innerHTML = files.map(f => {
-                    const displayName = f.includes('_') ? f.split('_').slice(3).join('_') : f;
-                    return `<div class="file-item"><a href="/download/${f}" download>📎 ${displayName}</a></div>`;
-                }).join('');
-            } else {
-                filesDiv.innerHTML = '<em>No files attached</em>';
-            }
-            
-            document.getElementById('editModal').classList.add('active');
-        }
-
-        function closeEditModal() {
-            document.getElementById('editModal').classList.remove('active');
-        }
-
-        async function updatePlasmid(event) {
-            event.preventDefault();
-            const formData = new FormData(event.target);
-            const id = formData.get('id');
-
-            const response = await fetch(`/api/plasmids/${id}`, {
-                method: 'PUT',
-                body: formData
-            });
-
-            if (response.ok) {
-                location.reload();
-            } else {
-                const data = await response.json().catch(() => ({}));
-                alert(data.error || 'Error updating plasmid');
-            }
-        }
-
-        // ---- Sequence Viewer ----
-        const featureColors = {
-            'CDS': '#4CAF50', 'gene': '#4CAF50',
-            'promoter': '#FF9800', 'terminator': '#f44336',
-            'rep_origin': '#2196F3', 'misc_feature': '#9C27B0',
-            'protein_bind': '#00BCD4', 'RBS': '#CDDC39'
-        };
-
-        async function viewSequence(filename) {
-            document.getElementById('seqModal').classList.add('active');
-            const displayName = filename.includes('_') ? filename.split('_').slice(3).join('_') : filename;
-            document.getElementById('seqModalTitle').textContent = '🔬 ' + displayName;
-            document.getElementById('seqDownloadBtn').href = '/download/' + filename;
-            document.getElementById('seqInfo').innerHTML = '<span style="color:#999">Loading...</span>';
-            document.getElementById('seqMapContainer').innerHTML = '<p style="color:#999;padding:40px">Loading plasmid map...</p>';
-            document.getElementById('seqText').textContent = 'Loading...';
-            document.getElementById('seqFeaturesContainer').innerHTML = 'Loading...';
-            showSeqTab('map');
-
-            try {
-                const resp = await fetch('/api/sequence/' + encodeURIComponent(filename));
-                const data = await resp.json();
-
-                // Info bar
-                let infoHtml = '';
-                infoHtml += `<div class="seq-info-item"><strong>Length:</strong> ${(data.length || 0).toLocaleString()} bp</div>`;
-                infoHtml += `<div class="seq-info-item"><strong>Topology:</strong> ${data.topology || 'unknown'}</div>`;
-                infoHtml += `<div class="seq-info-item"><strong>Format:</strong> ${data.format || 'unknown'}</div>`;
-                if (data.features) infoHtml += `<div class="seq-info-item"><strong>Features:</strong> ${data.features.length}</div>`;
-                if (data.insert_region) infoHtml += `<div class="seq-info-item" style="background:#fde8e8"><strong>Gene of Interest:</strong> ${data.insert_region.label} (${data.insert_region.start}-${data.insert_region.end})</div>`;
-                document.getElementById('seqInfo').innerHTML = infoHtml;
-
-                // Plasmid map (SVG)
-                if (data.topology === 'circular' && data.length > 0) {
-                    const svgResp = await fetch('/api/sequence-svg/' + encodeURIComponent(filename));
-                    const svgText = await svgResp.text();
-                    document.getElementById('seqMapContainer').innerHTML = svgText;
-                } else if (data.length > 0) {
-                    document.getElementById('seqMapContainer').innerHTML = `<div style="padding:40px;color:#7f8c8d"><p style="font-size:16px;margin-bottom:10px">Linear sequence (${data.length.toLocaleString()} bp)</p><p>Circular plasmid map not available for linear sequences.</p></div>`;
-                } else {
-                    document.getElementById('seqMapContainer').innerHTML = '<p style="color:#e74c3c;padding:40px">Could not parse sequence data</p>';
-                }
-
-                // Sequence text with insert highlighting
-                if (data.sequence && !data.sequence.startsWith('[')) {
-                    let seqHtml = '';
-                    const seq = data.sequence.toUpperCase();
-                    const lineLen = 60;
-                    const insertStart = data.insert_region ? data.insert_region.start : -1;
-                    const insertEnd = data.insert_region ? data.insert_region.end : -1;
-
-                    for (let i = 0; i < seq.length; i += lineLen) {
-                        const lineNum = String(i + 1).padStart(6, ' ');
-                        seqHtml += `<span class="line-num">${lineNum}</span>`;
-                        // Render chars with highlighting
-                        for (let j = i; j < Math.min(i + lineLen, seq.length); j++) {
-                            if (j >= insertStart && j < insertEnd) {
-                                seqHtml += `<span class="insert-highlight">${seq[j]}</span>`;
-                            } else {
-                                seqHtml += seq[j];
-                            }
-                            // Space every 10 chars
-                            if ((j - i + 1) % 10 === 0 && j < i + lineLen - 1) seqHtml += ' ';
-                        }
-                        seqHtml += '\\n';
-                    }
-                    document.getElementById('seqText').innerHTML = seqHtml;
-                } else {
-                    document.getElementById('seqText').textContent = data.sequence || 'No sequence data available';
-                }
-
-                // Features table
-                if (data.features && data.features.length > 0) {
-                    let ftHtml = '<table class="feature-table"><thead><tr><th>Type</th><th>Label</th><th>Location</th><th>Strand</th><th>Product</th></tr></thead><tbody>';
-                    data.features.forEach(f => {
-                        const color = featureColors[f.type] || '#607D8B';
-                        const isInsert = data.insert_region && f.start === data.insert_region.start && f.end === data.insert_region.end;
-                        const rowStyle = isInsert ? 'background:#fde8e8;font-weight:600' : '';
-                        ftHtml += `<tr style="${rowStyle}"><td><span class="feature-type" style="background:${color}">${f.type}</span></td><td>${f.label || '-'}</td><td>${f.start}..${f.end}</td><td>${f.strand === 1 ? '+' : f.strand === -1 ? '-' : '?'}</td><td>${f.product || '-'}</td></tr>`;
-                    });
-                    ftHtml += '</tbody></table>';
-                    document.getElementById('seqFeaturesContainer').innerHTML = ftHtml;
-                } else {
-                    document.getElementById('seqFeaturesContainer').innerHTML = '<p style="color:#7f8c8d;padding:20px">No annotated features found in this file.</p>';
-                }
-            } catch (err) {
-                document.getElementById('seqInfo').innerHTML = `<div style="color:#e74c3c">Error loading sequence: ${err.message}</div>`;
-            }
-        }
-
-        function closeSeqModal() {
-            document.getElementById('seqModal').classList.remove('active');
-        }
-
-        function showSeqTab(tab, evt) {
-            document.querySelectorAll('.seq-tab-content').forEach(el => el.style.display = 'none');
-            document.querySelectorAll('.seq-tab').forEach(el => el.classList.remove('active'));
-            document.getElementById('seqTab' + tab.charAt(0).toUpperCase() + tab.slice(1)).style.display = 'block';
-            if (evt && evt.target) {
-                evt.target.classList.add('active');
-            } else {
-                // Highlight first tab button by default
-                const tabs = document.querySelectorAll('.seq-tab');
-                const tabMap = {'map': 0, 'sequence': 1, 'features': 2};
-                if (tabs[tabMap[tab]]) tabs[tabMap[tab]].classList.add('active');
-            }
-        }
-    </script>
+const featureColors = {'CDS':'#2e7d32','gene':'#2e7d32','promoter':'#e65100','terminator':'#c62828','rep_origin':'#1565c0','misc_feature':'#6a1b9a','protein_bind':'#00838f','RBS':'#9e9d24'};
+async function viewSequence(filename) {
+    document.getElementById('seqModal').classList.add('active');
+    const dn = filename.includes('_')?filename.split('_').slice(3).join('_'):filename;
+    document.getElementById('seqModalTitle').textContent = dn;
+    document.getElementById('seqDownloadBtn').href = '/download/'+filename;
+    document.getElementById('seqInfo').innerHTML = '<span style="color:var(--fg3)">Loading...</span>';
+    document.getElementById('seqMapContainer').innerHTML = '<p style="color:var(--fg3);padding:40px">Loading...</p>';
+    document.getElementById('seqText').textContent = 'Loading...';
+    document.getElementById('seqFeaturesContainer').innerHTML = 'Loading...';
+    showSeqTab('map');
+    try {
+        const resp = await fetch('/api/sequence/'+encodeURIComponent(filename));
+        const data = await resp.json();
+        let info = '<span class="seq-badge"><b>'+((data.length||0).toLocaleString())+' bp</b></span>';
+        info += '<span class="seq-badge">'+( data.topology||'unknown')+'</span>';
+        info += '<span class="seq-badge">'+( data.format||'unknown')+'</span>';
+        if (data.features) info += '<span class="seq-badge">'+data.features.length+' features</span>';
+        if (data.insert_region) info += '<span class="seq-badge highlight"><b>GOI:</b> '+data.insert_region.label+' ('+data.insert_region.start+'-'+data.insert_region.end+')</span>';
+        document.getElementById('seqInfo').innerHTML = info;
+        if (data.topology==='circular'&&data.length>0) {
+            const sr = await fetch('/api/sequence-svg/'+encodeURIComponent(filename));
+            document.getElementById('seqMapContainer').innerHTML = await sr.text();
+        } else if (data.length>0) {
+            document.getElementById('seqMapContainer').innerHTML = '<div style="padding:40px;color:var(--fg3)">Linear sequence ('+data.length.toLocaleString()+' bp)</div>';
+        } else { document.getElementById('seqMapContainer').innerHTML = '<p style="color:var(--danger);padding:40px">Could not parse sequence data</p>'; }
+        if (data.sequence&&!data.sequence.startsWith('[')) {
+            let h=''; const s=data.sequence.toUpperCase(), ll=60, is=data.insert_region?data.insert_region.start:-1, ie=data.insert_region?data.insert_region.end:-1;
+            for(let i=0;i<s.length;i+=ll){h+='<span class="line-num">'+String(i+1).padStart(6,' ')+'</span>';for(let j=i;j<Math.min(i+ll,s.length);j++){h+=j>=is&&j<ie?'<span class="insert-highlight">'+s[j]+'</span>':s[j];if((j-i+1)%10===0&&j<i+ll-1)h+=' ';}h+='\\n';}
+            document.getElementById('seqText').innerHTML = h;
+        } else { document.getElementById('seqText').textContent = data.sequence||'No sequence data'; }
+        if (data.features&&data.features.length>0) {
+            let ft='<table class="feature-table"><thead><tr><th>Type</th><th>Label</th><th>Location</th><th>Strand</th><th>Product</th></tr></thead><tbody>';
+            data.features.forEach(f=>{const c=featureColors[f.type]||'#607D8B';const ins=data.insert_region&&f.start===data.insert_region.start&&f.end===data.insert_region.end;ft+='<tr'+(ins?' style="background:#fdf0ef;font-weight:600"':'')+'><td><span class="feature-type" style="background:'+c+'">'+f.type+'</span></td><td>'+(f.label||'-')+'</td><td>'+f.start+'..'+f.end+'</td><td>'+(f.strand===1?'+':f.strand===-1?'-':'?')+'</td><td>'+(f.product||'-')+'</td></tr>';});
+            ft+='</tbody></table>';
+            document.getElementById('seqFeaturesContainer').innerHTML = ft;
+        } else { document.getElementById('seqFeaturesContainer').innerHTML = '<p style="color:var(--fg3);padding:20px">No features found.</p>'; }
+    } catch(err) { document.getElementById('seqInfo').innerHTML = '<span style="color:var(--danger)">Error: '+err.message+'</span>'; }
+}
+function closeSeqModal() { document.getElementById('seqModal').classList.remove('active'); }
+function showSeqTab(tab, evt) {
+    document.querySelectorAll('.seq-tab-content').forEach(el=>el.style.display='none');
+    document.querySelectorAll('.seq-tab').forEach(el=>el.classList.remove('active'));
+    document.getElementById('seqTab'+tab.charAt(0).toUpperCase()+tab.slice(1)).style.display='block';
+    if(evt&&evt.target){evt.target.classList.add('active');}else{const tabs=document.querySelectorAll('.seq-tab');const m={'map':0,'sequence':1,'features':2};if(tabs[m[tab]])tabs[m[tab]].classList.add('active');}
+}
+</script>
 </body>
 </html>
 '''
@@ -873,9 +623,6 @@ def add_plasmid():
     # Validate mandatory fields
     if not data['added_by']:
         return jsonify({'error': 'Added By is required'}), 400
-    if not uploaded_files:
-        return jsonify({'error': 'At least one sequence file is required'}), 400
-    
     c.execute('''INSERT INTO plasmids 
                  (name, number, plasmid_backbone, inductor, antibiotic_resistance, reference, comment, files, added_by)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
@@ -914,8 +661,8 @@ def update_plasmid(id):
                 file.save(os.path.join(UPLOAD_DIR, filename))
                 uploaded_files.append(filename)
     
-    # Merge with existing files
-    existing_files = old_data[8] if old_data[8] else ''
+    # Merge with existing files (column index 10 = files)
+    existing_files = old_data[10] if old_data[10] else ''
     all_files = []
     if existing_files:
         all_files.extend(existing_files.split(','))
@@ -968,6 +715,42 @@ def delete_plasmid(id):
     log_audit('DELETE', record_id=id, old_data=old_data, ip_address=ip)
     
     return jsonify({'success': True})
+
+@app.route('/api/plasmids/<int:id>/remove-file', methods=['POST'])
+def remove_file(id):
+    """Remove a specific file from a plasmid entry"""
+    ip = request.remote_addr
+    filename = request.json.get('filename')
+    if not filename:
+        return jsonify({'error': 'No filename provided'}), 400
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT * FROM plasmids WHERE id = ?', (id,))
+    old_data = c.fetchone()
+    if not old_data:
+        conn.close()
+        return jsonify({'error': 'Entry not found'}), 404
+
+    current_files = old_data[10] or ''
+    file_list = [f.strip() for f in current_files.split(',') if f.strip()]
+    if filename not in file_list:
+        conn.close()
+        return jsonify({'error': 'File not found on this entry'}), 404
+
+    file_list.remove(filename)
+    new_files = ','.join(file_list) if file_list else None
+
+    c.execute('UPDATE plasmids SET files=?, modified_at=CURRENT_TIMESTAMP WHERE id=?',
+              (new_files, id))
+    conn.commit()
+    conn.close()
+
+    log_audit('REMOVE_FILE', record_id=id,
+              old_data={'file': filename}, new_data={'files': new_files},
+              ip_address=ip)
+
+    return jsonify({'success': True, 'remaining_files': new_files})
 
 @app.route('/api/backup', methods=['POST'])
 def manual_backup():
@@ -1393,116 +1176,193 @@ def admin_panel():
     
     return render_template_string(ADMIN_TEMPLATE, plasmids=plasmids, audit_logs=audit_logs, backups=backups)
 
-# Admin template with full table view and DELETE capability
+# Admin template
 ADMIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Admin - Plasmid Library</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,sans-serif;background:#f5f5f5;padding:20px}
-.container{max-width:1800px;margin:0 auto;background:white;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1)}
-.header{background:#8e44ad;color:white;padding:20px 30px;display:flex;justify-content:space-between;align-items:center}
-.header h1{font-size:24px}
-.btn{background:#3498db;color:white;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;margin-left:10px}
-.btn:hover{background:#2980b9}
-.btn-success{background:#27ae60}
-.content{padding:30px}
-.section{margin-bottom:40px}
-.section h2{color:#2c3e50;margin-bottom:20px;padding-bottom:10px;border-bottom:2px solid #ecf0f1}
-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
-th{background:#34495e;color:white;padding:10px;text-align:left;font-weight:600;font-size:12px}
-td{padding:10px;border-bottom:1px solid #ecf0f1}
-tr:hover{background:#f8f9fa}
-.delete-btn{background:#e74c3c;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px}
-.delete-btn:hover{background:#c0392b}
-.action-badge{padding:4px 8px;border-radius:3px;font-size:11px;font-weight:600}
-.action-insert{background:#d4edda;color:#155724}
-.action-update{background:#fff3cd;color:#856404}
-.action-delete{background:#f8d7da;color:#721c24}
-.action-backup{background:#d1ecf1;color:#0c5460}
-.backup-item{background:#f8f9fa;padding:15px;margin-bottom:10px;border-radius:4px;display:flex;justify-content:space-between;align-items:center}
-.backup-name{font-weight:600;color:#2c3e50}
-.backup-meta{font-size:12px;color:#7f8c8d;margin-top:5px}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-bottom:30px}
-.stat-card{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:20px;border-radius:8px}
-.stat-value{font-size:32px;font-weight:700;margin-bottom:5px}
-.stat-label{font-size:14px;opacity:0.9}
-.id-col{width:50px;font-weight:600;color:#3498db}
-.name-col{min-width:150px;font-weight:500}
-.warning-box{background:#fff3cd;border:2px solid #ffc107;padding:15px;border-radius:4px;margin-bottom:20px;color:#856404}
-.sortable{cursor:pointer;user-select:none}
-.sortable:hover{background:#2c3e50}
-.edit-btn{background:#f39c12;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px;margin-right:5px}
-.edit-btn:hover{background:#e67e22}
+:root { --fg: #1a1a1a; --fg2: #555; --fg3: #999; --bg: #fff; --bg2: #fafafa; --border: #e0e0e0; --accent: #1a6bb5; --danger: #c0392b; --mono: "SF Mono","Cascadia Code",Consolas,monospace; }
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{font-size:13px}
+body{font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);line-height:1.5}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 24px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;background:var(--bg)}
+.topbar h1{font-size:15px;font-weight:600}
+.topbar-actions{display:flex;gap:6px}
+.btn{display:inline-flex;align-items:center;gap:4px;padding:6px 14px;font-size:12px;font-weight:500;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--fg);cursor:pointer;text-decoration:none;white-space:nowrap}
+.btn:hover{background:var(--bg2)}
+.btn-primary{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.btn-primary:hover{background:#333}
+.btn-sm{padding:3px 8px;font-size:11px}
+.btn-danger{color:var(--danger);border-color:var(--danger)}
+.btn-danger:hover{background:#fdf0ef}
+.content{padding:16px 24px}
+.stats-row{display:flex;gap:24px;margin-bottom:20px;font-size:12px;color:var(--fg2)}
+.stats-row strong{color:var(--fg);font-size:18px;display:block}
+.section{margin-bottom:32px}
+.section-head{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:2px solid var(--border);margin-bottom:12px;cursor:pointer;user-select:none}
+.section-head h2{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.03em;color:var(--fg2)}
+.section-head .toggle{font-size:11px;color:var(--fg3)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:6px 8px;text-align:left;font-size:10px;font-weight:600;color:var(--fg2);text-transform:uppercase;letter-spacing:0.03em;border-bottom:2px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:var(--fg)}
+td{padding:6px 8px;border-bottom:1px solid #f0f0f0;vertical-align:top}
+tr:hover{background:#fafafa}
+.badge{padding:2px 6px;font-size:10px;font-weight:600;font-family:var(--mono)}
+.badge-insert{background:#e8f5e9;color:#2e7d32}
+.badge-update{background:#fff8e1;color:#f57f17}
+.badge-delete{background:#fce4ec;color:#c62828}
+.badge-backup{background:#e3f2fd;color:#1565c0}
+.backup-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:12px}
+.backup-row:last-child{border-bottom:none}
+/* modal */
+.modal{display:none;position:fixed;z-index:1000;inset:0;background:rgba(0,0,0,0.4)}
+.modal.active{display:flex;align-items:center;justify-content:center}
+.modal-box{background:var(--bg);border:1px solid var(--border);width:90%;max-width:720px;max-height:90vh;overflow-y:auto}
+.modal-head{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border)}
+.modal-head h2{font-size:14px;font-weight:600}
+.modal-body{padding:16px}
+.modal-foot{display:flex;gap:6px;padding:12px 16px;border-top:1px solid var(--border)}
+.form-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.form-group{margin-bottom:8px}
+.form-group.full-width{grid-column:1/-1}
+.form-group label{display:block;font-size:11px;font-weight:600;color:var(--fg2);margin-bottom:4px;text-transform:uppercase;letter-spacing:0.03em}
+.form-group input,.form-group textarea{width:100%;padding:6px 8px;font-size:12px;border:1px solid var(--border);border-radius:3px;font-family:inherit;background:var(--bg)}
+.form-group input:focus,.form-group textarea:focus{outline:none;border-color:var(--accent)}
+.form-group textarea{min-height:60px;resize:vertical}
+.form-group input[readonly]{background:var(--bg2);color:var(--fg3)}
+.file-tag{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;margin:2px;background:var(--bg2);border:1px solid var(--border);font-size:11px}
+.file-tag a{color:var(--accent);text-decoration:none}
+.file-tag .remove-btn{background:none;border:none;color:var(--fg3);cursor:pointer;font-size:14px;line-height:1;padding:0 2px}
+.file-tag .remove-btn:hover{color:var(--danger)}
 </style></head>
-<body><div class="container"><div class="header"><h1>🔐 Admin Panel</h1><div><a href="/" class="btn">← Back to Database</a><a href="/admin/logout" class="btn" style="background:#e74c3c">Logout</a></div></div>
+<body>
+<div class="topbar">
+    <h1>Admin</h1>
+    <div class="topbar-actions">
+        <a href="/" class="btn">Back to Library</a>
+        <a href="/admin/logout" class="btn">Logout</a>
+    </div>
+</div>
 <div class="content">
-<div class="warning-box"><strong>⚠️ Admin Access:</strong> This panel has DELETE capabilities. All deletions are logged in the audit trail.</div>
+<div class="stats-row">
+    <div><strong>{{ plasmids|length }}</strong>Plasmids</div>
+    <div><strong>{{ backups|length }}</strong>Backups</div>
+</div>
 
-<div class="stats"><div class="stat-card"><div class="stat-value">{{ plasmids|length }}</div><div class="stat-label">Total Plasmids</div></div><div class="stat-card"><div class="stat-value">{{ backups|length }}</div><div class="stat-label">Backups</div></div><div class="stat-card"><div class="stat-value">📅</div><div class="stat-label">Next: Friday 6PM</div></div></div>
-
-<div class="section"><h2 onclick="toggleSection('plasmids')" style="cursor:pointer">🧬 All Plasmids <span id="plasmids-toggle">▼</span></h2>
+<div class="section">
+<div class="section-head" onclick="toggleSection('plasmids')"><h2>All Plasmids</h2><span class="toggle" id="plasmids-toggle">show</span></div>
 <div id="plasmids-section" style="display:none">
-<div style="overflow-x:auto"><table id="adminTable"><thead><tr><th class="sortable" onclick="sortAdminTable(0)">ID</th><th class="sortable" onclick="sortAdminTable(1)">Name</th><th class="sortable" onclick="sortAdminTable(2)">Backbone</th><th class="sortable" onclick="sortAdminTable(3)">Inductor</th><th class="sortable" onclick="sortAdminTable(4)">Resistance</th><th class="sortable" onclick="sortAdminTable(5)">Reference</th><th class="sortable" onclick="sortAdminTable(6)">Comment</th><th>Files</th><th class="sortable" onclick="sortAdminTable(8)">Added On</th><th class="sortable" onclick="sortAdminTable(9)">Added By</th><th>Action</th></tr></thead><tbody>
-{% for p in plasmids %}<tr><td>{{ p[2] or '-' }}</td><td>{{ p[1] }}</td><td>{{ p[3] or '-' }}</td><td>{{ p[4] or '-' }}</td><td>{{ p[5] or '-' }}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p[6] or '' }}">{{ p[6] or '-' }}</td><td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p[7] or '' }}">{{ p[7] or '-' }}</td><td>{% if p[10] %}{{ p[10].split(',')|length }} file(s){% else %}-{% endif %}</td><td>{{ p[11][:10] if p[11] else '-' }}</td><td>{{ p[12] or '-' }}</td><td><button class="edit-btn" onclick="window.open('/', '_blank')">Edit</button> <button class="delete-btn" onclick="deletePlasmid({{ p[0] }})">Delete</button></td></tr>
-{% endfor %}</tbody></table></div></div></div>
+<div style="overflow-x:auto"><table id="adminTable"><thead><tr>
+<th onclick="sortAdminTable(0)">ID</th><th onclick="sortAdminTable(1)">Name</th><th onclick="sortAdminTable(2)">Backbone</th><th onclick="sortAdminTable(3)">Inductor</th><th onclick="sortAdminTable(4)">Resistance</th><th onclick="sortAdminTable(5)">Reference</th><th onclick="sortAdminTable(6)">Comment</th><th>Files</th><th onclick="sortAdminTable(8)">Added</th><th onclick="sortAdminTable(9)">By</th><th></th>
+</tr></thead><tbody>
+{% for p in plasmids %}<tr>
+<td style="font-family:var(--mono);font-weight:600">{{ p[2] or '-' }}</td><td style="font-weight:500">{{ p[1] }}</td><td>{{ p[3] or '-' }}</td><td>{{ p[4] or '-' }}</td><td>{{ p[5] or '-' }}</td>
+<td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p[6] or '' }}">{{ p[6] or '-' }}</td>
+<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p[7] or '' }}">{{ p[7] or '-' }}</td>
+<td>{% if p[10] %}{{ p[10].split(',')|length }}{% else %}-{% endif %}</td>
+<td>{{ p[11][:10] if p[11] else '-' }}</td><td>{{ p[12] or '-' }}</td>
+<td style="white-space:nowrap"><button class="btn btn-sm" onclick='editPlasmid({{ p[0] }}, {{ p|tojson }})'>Edit</button> <button class="btn btn-sm btn-danger" onclick="deletePlasmid({{ p[0] }})">Delete</button></td>
+</tr>{% endfor %}</tbody></table></div></div></div>
 
-<div class="section"><h2 onclick="toggleSection('backups')" style="cursor:pointer">📦 Backups <span id="backups-toggle">▼</span></h2>
-<div id="backups-section" style="display:none"><div style="margin-bottom:15px"><button class="btn btn-success" onclick="createBackup()">Backup Now</button> <a href="/admin/download-archive" class="btn" style="background:#2ecc71">⬇ Download Archive (DB + HTML)</a></div>{% if backups %}{% for b in backups %}<div class="backup-item"><div><div class="backup-name">{{ b.name }}</div><div class="backup-meta">{{ b.size }} | {{ b.date }}</div></div><div><a href="/admin/download-backup/{{ b.name }}" class="btn" style="background:#3498db;font-size:12px;padding:8px 12px">⬇ Download</a></div></div>{% endfor %}{% else %}<p style="color:#7f8c8d">No backups yet</p>{% endif %}</div></div>
-
-<div class="section"><h2 onclick="toggleSection('audit')" style="cursor:pointer">📋 Audit Log (Last 100) <span id="audit-toggle">▼</span></h2>
-<div id="audit-section" style="display:none">{% if audit_logs %}<div style="overflow-x:auto"><table><thead><tr><th>ID</th><th>Time</th><th>Action</th><th>Record</th><th>IP</th><th>Data Preview</th></tr></thead><tbody>{% for log in audit_logs %}<tr><td>{{ log[0] }}</td><td>{{ log[1][:19] }}</td><td><span class="action-badge action-{{ log[2].lower() }}">{{ log[2] }}</span></td><td>{{ log[3] or '-' }}</td><td>{{ log[6] or '-' }}</td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:10px">{{ log[4][:40] if log[4] else (log[5][:40] if log[5] else '-') }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p style="color:#7f8c8d">No logs yet</p>{% endif %}</div></div>
+<div class="section">
+<div class="section-head" onclick="toggleSection('backups')"><h2>Backups</h2><span class="toggle" id="backups-toggle">show</span></div>
+<div id="backups-section" style="display:none">
+<div style="margin-bottom:12px;display:flex;gap:6px"><button class="btn" onclick="createBackup()">Create Backup</button><a href="/admin/download-archive" class="btn">Download Archive</a></div>
+{% if backups %}{% for b in backups %}<div class="backup-row"><div><span style="font-weight:500">{{ b.name }}</span><span style="color:var(--fg3);margin-left:8px">{{ b.size }}</span></div><a href="/admin/download-backup/{{ b.name }}" class="btn btn-sm">Download</a></div>{% endfor %}{% else %}<p style="color:var(--fg3)">No backups yet</p>{% endif %}
 </div></div>
+
+<div class="section">
+<div class="section-head" onclick="toggleSection('audit')"><h2>Audit Log</h2><span class="toggle" id="audit-toggle">show</span></div>
+<div id="audit-section" style="display:none">
+{% if audit_logs %}<div style="overflow-x:auto"><table><thead><tr><th>ID</th><th>Time</th><th>Action</th><th>Record</th><th>IP</th><th>Data</th></tr></thead><tbody>
+{% for log in audit_logs %}<tr><td>{{ log[0] }}</td><td style="font-family:var(--mono);font-size:11px">{{ log[1][:19] }}</td><td><span class="badge badge-{{ log[2].lower() }}">{{ log[2] }}</span></td><td>{{ log[3] or '-' }}</td><td style="font-family:var(--mono)">{{ log[6] or '-' }}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:10px">{{ log[4][:40] if log[4] else (log[5][:40] if log[5] else '-') }}</td></tr>{% endfor %}
+</tbody></table></div>{% else %}<p style="color:var(--fg3)">No logs</p>{% endif %}
+</div></div>
+</div>
+
+<div id="editModal" class="modal">
+<div class="modal-box">
+<div class="modal-head"><h2>Edit Plasmid</h2><button class="btn btn-sm" onclick="closeEditModal()">Close</button></div>
+<form onsubmit="updatePlasmid(event)" enctype="multipart/form-data">
+<div class="modal-body">
+<input type="hidden" id="edit_id" name="id">
+<div class="form-grid">
+<div class="form-group"><label>ID</label><input type="number" id="edit_number" name="number" readonly></div>
+<div class="form-group"><label>Name *</label><input type="text" id="edit_name" name="name" required></div>
+<div class="form-group"><label>Backbone</label><input type="text" id="edit_plasmid_backbone" name="plasmid_backbone"></div>
+<div class="form-group"><label>Inductor</label><input type="text" id="edit_inductor" name="inductor"></div>
+<div class="form-group"><label>Resistance</label><input type="text" id="edit_antibiotic_resistance" name="antibiotic_resistance"></div>
+<div class="form-group"><label>Reference</label><input type="text" id="edit_reference" name="reference"></div>
+<div class="form-group"><label>Added By</label><input type="text" id="edit_added_by" name="added_by"></div>
+<div class="form-group full-width"><label>Comment</label><textarea id="edit_comment" name="comment"></textarea></div>
+<div class="form-group full-width"><label>Files</label><div id="current_files"></div></div>
+<div class="form-group full-width"><label>Add Files</label><input type="file" name="files" multiple></div>
+</div>
+</div>
+<div class="modal-foot"><button type="submit" class="btn btn-primary">Save</button><button type="button" class="btn" onclick="closeEditModal()">Cancel</button></div>
+</form>
+</div>
+</div>
+
 <script>
-let adminSortDir={};
-function toggleSection(id){const section=document.getElementById(id+'-section');const toggle=document.getElementById(id+'-toggle');if(section.style.display==='none'){section.style.display='block';toggle.textContent='▲'}else{section.style.display='none';toggle.textContent='▼'}}
-function sortAdminTable(col){const table=document.getElementById('adminTable');const tbody=table.querySelector('tbody');const rows=Array.from(tbody.querySelectorAll('tr'));const dir=adminSortDir[col]==='asc'?'desc':'asc';adminSortDir={[col]:dir};rows.sort((a,b)=>{let aVal=a.cells[col].textContent.trim();let bVal=b.cells[col].textContent.trim();if(aVal==='-')aVal='';if(bVal==='-')bVal='';const aNum=parseFloat(aVal);const bNum=parseFloat(bVal);if(!isNaN(aNum)&&!isNaN(bNum))return dir==='asc'?aNum-bNum:bNum-aNum;return dir==='asc'?aVal.localeCompare(bVal):bVal.localeCompare(aVal)});rows.forEach(row=>tbody.appendChild(row))}
-async function createBackup(){if(!confirm('Create backup?'))return;const r=await fetch('/api/backup',{method:'POST'});if(r.ok){alert('Backup created!');location.reload()}else{alert('Error')}}
-async function deletePlasmid(id){if(!confirm('⚠️ PERMANENTLY DELETE this plasmid? This action is logged but cannot be undone!'))return;const r=await fetch(`/api/plasmids/${id}`,{method:'DELETE'});if(r.ok){alert('Deleted successfully');location.reload()}else{alert('Error deleting')}}
+let adminSortDir={}, _editId=null;
+function toggleSection(id){const s=document.getElementById(id+'-section'),t=document.getElementById(id+'-toggle');if(s.style.display==='none'){s.style.display='block';t.textContent='hide'}else{s.style.display='none';t.textContent='show'}}
+function sortAdminTable(col){const table=document.getElementById('adminTable'),tbody=table.querySelector('tbody'),rows=Array.from(tbody.querySelectorAll('tr'));const dir=adminSortDir[col]==='asc'?'desc':'asc';adminSortDir={[col]:dir};rows.sort((a,b)=>{let av=a.cells[col].textContent.trim(),bv=b.cells[col].textContent.trim();if(av==='-')av='';if(bv==='-')bv='';const an=parseFloat(av),bn=parseFloat(bv);if(!isNaN(an)&&!isNaN(bn))return dir==='asc'?an-bn:bn-an;return dir==='asc'?av.localeCompare(bv):bv.localeCompare(av)});rows.forEach(r=>tbody.appendChild(r))}
+async function createBackup(){if(!confirm('Create backup?'))return;const r=await fetch('/api/backup',{method:'POST'});if(r.ok)location.reload();else alert('Error')}
+async function deletePlasmid(id){if(!confirm('Permanently delete this entry?'))return;const r=await fetch('/api/plasmids/'+id,{method:'DELETE'});if(r.ok)location.reload();else alert('Error')}
+function editPlasmid(id,data){
+    _editId=id;
+    document.getElementById('edit_id').value=id;
+    document.getElementById('edit_number').value=data[2]||'';
+    document.getElementById('edit_name').value=data[1]||'';
+    document.getElementById('edit_plasmid_backbone').value=data[3]||'';
+    document.getElementById('edit_inductor').value=data[4]||'';
+    document.getElementById('edit_antibiotic_resistance').value=data[5]||'';
+    document.getElementById('edit_reference').value=data[6]||'';
+    document.getElementById('edit_comment').value=data[7]||'';
+    document.getElementById('edit_added_by').value=data[12]||'';
+    const fd=document.getElementById('current_files');
+    if(data[10]){fd.innerHTML=data[10].split(',').map(f=>{const dn=f.includes('_')?f.split('_').slice(3).join('_'):f;const safe=f.replace(/[^a-zA-Z0-9]/g,'_');return'<span class="file-tag" id="afile-'+safe+'"><a href="/download/'+f+'" download>'+dn+'</a><button type="button" class="remove-btn" data-fn="'+f+'">&times;</button></span>'}).join('');fd.querySelectorAll('.remove-btn').forEach(b=>b.onclick=function(){removeFile(this.dataset.fn)})}
+    else{fd.innerHTML='<span style="color:var(--fg3);font-size:11px">No files</span>'}
+    document.getElementById('editModal').classList.add('active');
+}
+function closeEditModal(){document.getElementById('editModal').classList.remove('active')}
+async function removeFile(fn){if(!confirm('Remove file?'))return;const r=await fetch('/api/plasmids/'+_editId+'/remove-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})});if(r.ok){const el=document.getElementById('afile-'+fn.replace(/[^a-zA-Z0-9]/g,'_'));if(el)el.remove();const fd=document.getElementById('current_files');if(!fd.querySelector('.file-tag'))fd.innerHTML='<span style="color:var(--fg3);font-size:11px">No files</span>'}else alert('Error')}
+async function updatePlasmid(e){e.preventDefault();const fd=new FormData(e.target);const r=await fetch('/api/plasmids/'+fd.get('id'),{method:'PUT',body:fd});if(r.ok)location.reload();else{const d=await r.json().catch(()=>({}));alert(d.error||'Error')}}
 </script></body></html>
 '''
 
 # Login template
 LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Admin Login - Plasmid Library</title>
+<html><head><meta charset="UTF-8"><title>Admin Login</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;display:flex;align-items:center;justify-content:center}
-.login-container{background:white;padding:40px;border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,0.2);width:100%;max-width:400px}
-.login-header{text-align:center;margin-bottom:30px}
-.login-header h1{color:#2c3e50;font-size:28px;margin-bottom:10px}
-.login-header p{color:#7f8c8d;font-size:14px}
-.form-group{margin-bottom:20px}
-.form-group label{display:block;margin-bottom:8px;color:#2c3e50;font-weight:600;font-size:14px}
-.form-group input{width:100%;padding:12px;border:2px solid #ddd;border-radius:6px;font-size:14px;transition:border-color 0.3s}
-.form-group input:focus{outline:none;border-color:#8e44ad}
-.btn-login{width:100%;background:#8e44ad;color:white;border:none;padding:14px;border-radius:6px;font-size:16px;font-weight:600;cursor:pointer;transition:background 0.3s}
-.btn-login:hover{background:#7d3c98}
-.error-msg{background:#f8d7da;color:#721c24;padding:12px;border-radius:6px;margin-bottom:20px;font-size:14px;border:1px solid #f5c6cb}
-.back-link{text-align:center;margin-top:20px}
-.back-link a{color:#8e44ad;text-decoration:none;font-size:14px}
-.back-link a:hover{text-decoration:underline}
+body{font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;background:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-box{width:100%;max-width:320px;padding:24px}
+.login-box h1{font-size:15px;font-weight:600;margin-bottom:4px}
+.login-box p{font-size:12px;color:#999;margin-bottom:20px}
+.field{margin-bottom:16px}
+.field label{display:block;font-size:11px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:0.03em;margin-bottom:4px}
+.field input{width:100%;padding:8px 10px;font-size:13px;border:1px solid #e0e0e0;border-radius:3px;font-family:inherit}
+.field input:focus{outline:none;border-color:#1a6bb5}
+.submit-btn{width:100%;padding:8px;font-size:13px;font-weight:500;background:#1a1a1a;color:#fff;border:none;border-radius:3px;cursor:pointer}
+.submit-btn:hover{background:#333}
+.error{padding:8px;margin-bottom:12px;font-size:12px;color:#c0392b;border:1px solid #fce4ec;background:#fdf0ef}
+.back{margin-top:16px;text-align:center}
+.back a{font-size:12px;color:#999;text-decoration:none}
+.back a:hover{color:#1a1a1a}
 </style></head>
 <body>
-<div class="login-container">
-<div class="login-header">
-<h1>🔐 Admin Login</h1>
-<p>Enter password to access admin panel</p>
-</div>
-{% if error %}
-<div class="error-msg">❌ Incorrect password. Please try again.</div>
-{% endif %}
+<div class="login-box">
+<h1>Admin Login</h1>
+<p>Plasmid Library</p>
+{% if error %}<div class="error">Incorrect password.</div>{% endif %}
 <form method="POST">
-<div class="form-group">
-<label>Password</label>
-<input type="password" name="password" required autofocus placeholder="Enter admin password">
-</div>
-<button type="submit" class="btn-login">Login</button>
+<div class="field"><label>Password</label><input type="password" name="password" required autofocus></div>
+<button type="submit" class="submit-btn">Login</button>
 </form>
-<div class="back-link">
-<a href="/">← Back to Database</a>
-</div>
+<div class="back"><a href="/">Back to library</a></div>
 </div>
 </body></html>
 '''
@@ -1513,65 +1373,73 @@ EXPORT_TEMPLATE = '''
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Plasmid Library - Genetic Material Registry</title>
+<title>Plasmid Library Registry</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#fff;color:#2c3e50;padding:30px;max-width:1200px;margin:0 auto}
-.report-header{border-bottom:3px solid #2c3e50;padding-bottom:20px;margin-bottom:30px}
-.report-header h1{font-size:28px;color:#2c3e50;margin-bottom:5px}
-.report-header .subtitle{font-size:14px;color:#7f8c8d}
-.report-meta{display:flex;gap:30px;margin-top:15px;flex-wrap:wrap}
-.report-meta-item{font-size:13px;color:#555}
-.report-meta-item strong{color:#2c3e50}
-.toc{background:#f8f9fa;border-radius:6px;padding:20px;margin-bottom:30px}
-.toc h2{font-size:16px;margin-bottom:10px;color:#34495e}
-.toc-list{column-count:3;column-gap:20px;list-style:none;font-size:12px}
-.toc-list li{margin-bottom:4px}
-.toc-list a{color:#3498db;text-decoration:none}
-.toc-list a:hover{text-decoration:underline}
-.plasmid-entry{border:1px solid #ddd;border-radius:8px;margin-bottom:25px;page-break-inside:avoid}
-.plasmid-entry-header{background:#34495e;color:white;padding:12px 20px;border-radius:8px 8px 0 0;display:flex;justify-content:space-between;align-items:center}
-.plasmid-entry-header h3{font-size:16px;font-weight:600}
-.plasmid-entry-header .pid{font-size:20px;font-weight:700;color:#3498db;background:white;padding:4px 12px;border-radius:4px}
-.plasmid-body{padding:20px}
-.plasmid-meta{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:15px}
-.meta-field{font-size:12px}
-.meta-field .label{color:#7f8c8d;font-weight:600;text-transform:uppercase;font-size:10px;display:block}
-.meta-field .value{color:#2c3e50;margin-top:2px}
-.seq-section{margin-top:15px;border-top:1px solid #eee;padding-top:15px}
-.seq-section h4{font-size:14px;color:#34495e;margin-bottom:10px}
-.seq-display{display:flex;gap:20px;flex-wrap:wrap}
-.seq-map-export{flex:0 0 300px;text-align:center;cursor:pointer;border:2px solid transparent;border-radius:6px;padding:4px;transition:border-color 0.2s}
-.seq-map-export:hover{border-color:#3498db}
-.seq-map-export::after{content:"click to zoom";display:block;font-size:10px;color:#999;margin-top:4px}
-.seq-data-export{flex:1;min-width:300px}
-.seq-box{background:#1e1e1e;color:#d4d4d4;font-family:'Courier New',monospace;font-size:10px;padding:12px;border-radius:4px;max-height:300px;overflow-y:auto;word-break:break-all;white-space:pre-wrap;line-height:1.5}
-.seq-box .insert-hl{color:#e74c3c;font-weight:bold;background:rgba(231,76,60,0.15)}
-.seq-info-badge{display:inline-block;background:#ecf0f1;padding:3px 8px;border-radius:3px;font-size:11px;margin:2px}
-.seq-info-badge.insert{background:#fde8e8;color:#e74c3c;font-weight:600}
-.features-mini{font-size:11px;margin-top:10px}
-.features-mini table{width:100%;border-collapse:collapse}
-.features-mini th{background:#ecf0f1;padding:4px 8px;text-align:left;font-size:10px;font-weight:600}
-.features-mini td{padding:4px 8px;border-bottom:1px solid #f0f0f0;font-size:10px}
-.footer{border-top:2px solid #2c3e50;padding-top:15px;margin-top:40px;font-size:11px;color:#7f8c8d;text-align:center}
-.lightbox{display:none;position:fixed;z-index:9999;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);align-items:center;justify-content:center;cursor:pointer}
-.lightbox.active{display:flex}
-.lightbox-content{max-width:90vw;max-height:90vh;background:white;border-radius:8px;padding:20px;position:relative}
-.lightbox-content svg{width:80vmin;height:80vmin}
-.lightbox-close{position:absolute;top:-12px;right:-12px;background:#e74c3c;color:white;border:none;border-radius:50%;width:30px;height:30px;font-size:16px;cursor:pointer;font-weight:bold}
-.dl-link{display:inline-block;background:#34495e;color:white;padding:3px 8px;border-radius:3px;font-size:10px;text-decoration:none;margin-top:4px}
-.dl-link:hover{background:#2c3e50}
-@media print{body{padding:10px;font-size:11px}.plasmid-entry{break-inside:avoid}.seq-box{max-height:none}.lightbox{display:none!important}}
+:root { --fg: #1a1a1a; --fg2: #555; --fg3: #999; --bg: #fff; --bg2: #fafafa; --border: #e0e0e0; --accent: #2e7d4f; --accent-light: #eaf6ef; --danger: #c0392b; --mono: "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace; }
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg); background: var(--bg); line-height: 1.5; max-width: 1200px; margin: 0 auto; padding: 40px 30px; }
+
+.hero { padding: 48px 0 40px; border-bottom: 3px solid var(--fg); margin-bottom: 36px; }
+.hero h1 { font-size: 36px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 4px; color: var(--fg); }
+.hero .subtitle { font-size: 15px; color: var(--fg2); margin-bottom: 20px; }
+.hero-meta { display: flex; gap: 32px; flex-wrap: wrap; }
+.hero-meta span { font-size: 13px; color: var(--fg2); }
+.hero-meta strong { color: var(--fg); font-weight: 600; }
+
+.toc { border: 1px solid var(--border); padding: 20px 24px; margin-bottom: 36px; }
+.toc h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fg2); margin-bottom: 12px; }
+.toc-list { column-count: 3; column-gap: 24px; list-style: none; font-size: 12px; }
+.toc-list li { margin-bottom: 3px; }
+.toc-list a { color: var(--accent); text-decoration: none; }
+.toc-list a:hover { text-decoration: underline; }
+
+.entry { margin-bottom: 28px; page-break-inside: avoid; border: 1px solid var(--border); border-left: 3px solid var(--accent); }
+.entry-head { background: var(--fg); color: var(--bg); padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; }
+.entry-head h3 { font-size: 15px; font-weight: 600; }
+.entry-head .pid { font-size: 22px; font-weight: 800; font-family: var(--mono); letter-spacing: -0.02em; color: #7dcea0; }
+.entry-body { padding: 16px 20px; }
+.entry-meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.field { font-size: 12px; }
+.field .label { display: block; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; color: var(--fg3); }
+.field .value { color: var(--fg); margin-top: 1px; }
+
+.seq-section { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
+.seq-section h4 { font-size: 13px; font-weight: 600; color: var(--fg); margin-bottom: 8px; }
+.seq-badges { margin-bottom: 8px; }
+.badge { display: inline-block; padding: 2px 8px; border: 1px solid var(--border); font-size: 11px; margin: 2px 2px 2px 0; background: var(--accent-light); }
+.badge.insert { border-color: var(--danger); color: var(--danger); font-weight: 600; }
+.seq-display { display: flex; gap: 20px; flex-wrap: wrap; }
+.seq-map-export { flex: 0 0 280px; text-align: center; cursor: pointer; border: 1px solid var(--border); padding: 4px; }
+.seq-map-export:hover { border-color: var(--fg); }
+.seq-map-export::after { content: "click to zoom"; display: block; font-size: 10px; color: var(--fg3); margin-top: 4px; }
+.seq-data-export { flex: 1; min-width: 280px; }
+.seq-box { background: #1a1a1a; color: #ccc; font-family: var(--mono); font-size: 10px; padding: 12px; max-height: 280px; overflow-y: auto; word-break: break-all; white-space: pre-wrap; line-height: 1.6; }
+.seq-box .insert-hl { color: #e74c3c; font-weight: bold; background: rgba(231,76,60,0.15); }
+
+.features-mini { font-size: 11px; margin-top: 10px; }
+.features-mini table { width: 100%; border-collapse: collapse; }
+.features-mini th { padding: 4px 8px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; color: var(--fg2); border-bottom: 2px solid var(--fg); }
+.features-mini td { padding: 4px 8px; border-bottom: 1px solid var(--border); font-size: 10px; }
+
+.footer { border-top: 3px solid var(--accent); padding-top: 16px; margin-top: 48px; font-size: 12px; color: var(--fg3); text-align: center; }
+
+.lightbox { display: none; position: fixed; z-index: 9999; inset: 0; background: rgba(0,0,0,0.85); align-items: center; justify-content: center; cursor: pointer; }
+.lightbox.active { display: flex; }
+.lightbox-content { max-width: 90vw; max-height: 90vh; background: white; padding: 20px; position: relative; }
+.lightbox-content svg { width: 80vmin; height: 80vmin; }
+.lightbox-close { position: absolute; top: -12px; right: -12px; background: var(--fg); color: white; border: none; width: 28px; height: 28px; font-size: 16px; cursor: pointer; font-weight: bold; }
+
+@media print { body { padding: 10px; font-size: 11px; } .entry { break-inside: avoid; } .seq-box { max-height: none; } .lightbox { display: none !important; } }
 </style>
 </head>
 <body>
-<div class="report-header">
-<h1>Plasmid Library - Genetic Material Registry</h1>
-<p class="subtitle">Complete inventory of genetic resources with sequence data</p>
-<div class="report-meta">
-<div class="report-meta-item"><strong>Export Date:</strong> {{ export_date }}</div>
-<div class="report-meta-item"><strong>Total Entries:</strong> {{ total }}</div>
-<div class="report-meta-item"><strong>Institution:</strong> Your Institution</div>
+<div class="hero">
+<h1>Plasmid Library</h1>
+<p class="subtitle">Genetic Material Registry</p>
+<div class="hero-meta">
+<span><strong>Export Date</strong> {{ export_date }}</span>
+<span><strong>Total Entries</strong> {{ total }}</span>
+<span><strong>Institution</strong> Your Institution</span>
 </div>
 </div>
 
@@ -1579,35 +1447,35 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <h2>Table of Contents ({{ total }} entries)</h2>
 <ul class="toc-list">
 {% for p in plasmids %}
-<li><a href="#entry-{{ p.number }}">P{{ p.number }} - {{ p.name }}</a></li>
+<li><a href="#entry-{{ p.number }}">P{{ p.number }} {{ p.name }}</a></li>
 {% endfor %}
 </ul>
 </div>
 
 {% for p in plasmids %}
-<div class="plasmid-entry" id="entry-{{ p.number }}">
-<div class="plasmid-entry-header">
+<div class="entry" id="entry-{{ p.number }}">
+<div class="entry-head">
 <h3>{{ p.name }}</h3>
 <span class="pid">P{{ p.number }}</span>
 </div>
-<div class="plasmid-body">
-<div class="plasmid-meta">
-<div class="meta-field"><span class="label">Plasmid Backbone</span><span class="value">{{ p.backbone or 'N/A' }}</span></div>
-<div class="meta-field"><span class="label">Inductor</span><span class="value">{{ p.inductor or 'N/A' }}</span></div>
-<div class="meta-field"><span class="label">Antibiotic Resistance</span><span class="value">{{ p.resistance or 'N/A' }}</span></div>
-<div class="meta-field"><span class="label">Reference</span><span class="value">{{ p.reference or 'N/A' }}</span></div>
-<div class="meta-field"><span class="label">Date Added</span><span class="value">{{ p.created_at[:10] if p.created_at else 'N/A' }}</span></div>
+<div class="entry-body">
+<div class="entry-meta">
+<div class="field"><span class="label">Backbone</span><span class="value">{{ p.backbone or '-' }}</span></div>
+<div class="field"><span class="label">Inductor</span><span class="value">{{ p.inductor or '-' }}</span></div>
+<div class="field"><span class="label">Resistance</span><span class="value">{{ p.resistance or '-' }}</span></div>
+<div class="field"><span class="label">Reference</span><span class="value">{{ p.reference or '-' }}</span></div>
+<div class="field"><span class="label">Date Added</span><span class="value">{{ p.created_at[:10] if p.created_at else '-' }}</span></div>
 </div>
-{% if p.comment %}<div class="meta-field" style="margin-bottom:10px"><span class="label">Comment</span><span class="value">{{ p.comment }}</span></div>{% endif %}
+{% if p.comment %}<div class="field" style="margin-bottom:10px"><span class="label">Comment</span><span class="value">{{ p.comment }}</span></div>{% endif %}
 
 {% for seq in p.sequences %}
 <div class="seq-section">
-<h4>Sequence: {{ seq.filename.split('_', 3)[-1] if '_' in seq.filename else seq.filename }}</h4>
-<div style="margin-bottom:8px">
-<span class="seq-info-badge"><strong>Length:</strong> {{ seq.length|default(0) }} bp</span>
-<span class="seq-info-badge"><strong>Topology:</strong> {{ seq.topology|default('unknown') }}</span>
-<span class="seq-info-badge"><strong>Format:</strong> {{ seq.format|default('unknown') }}</span>
-{% if seq.insert_region %}<span class="seq-info-badge insert"><strong>Gene of Interest:</strong> {{ seq.insert_region.label }} ({{ seq.insert_region.start }}-{{ seq.insert_region.end }})</span>{% endif %}
+<h4>{{ seq.filename.split('_', 3)[-1] if '_' in seq.filename else seq.filename }}</h4>
+<div class="seq-badges">
+<span class="badge"><strong>{{ seq.length|default(0) }}</strong> bp</span>
+<span class="badge">{{ seq.topology|default('unknown') }}</span>
+<span class="badge">{{ seq.format|default('unknown') }}</span>
+{% if seq.insert_region %}<span class="badge insert"><strong>GOI:</strong> {{ seq.insert_region.label }} ({{ seq.insert_region.start }}-{{ seq.insert_region.end }})</span>{% endif %}
 </div>
 <div class="seq-display">
 {% if seq.svg %}
@@ -1619,7 +1487,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 {% endfor %}{% else %}{% for i in range(0, seq.sequence|length, 60) %}{% set line = seq.sequence[i:i+60] %}<span style="color:#666">{{ '%6d'|format(i+1) }} </span>{% for j in range(line|length) %}{{ line[j]|upper }}{% if (j+1) % 10 == 0 and j < line|length - 1 %} {% endif %}{% endfor %}
 {% endfor %}{% endif %}</div>
 {% else %}
-<p style="color:#999;font-size:12px">Sequence data could not be extracted from this file format.</p>
+<p style="color:var(--fg3);font-size:12px">Sequence data could not be extracted from this file format.</p>
 {% endif %}
 </div>
 </div>
@@ -1627,7 +1495,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div class="features-mini">
 <table><thead><tr><th>Type</th><th>Label</th><th>Location</th><th>Strand</th><th>Product</th></tr></thead><tbody>
 {% for f in seq.features %}
-<tr{% if seq.insert_region and f.start == seq.insert_region.start and f.end == seq.insert_region.end %} style="background:#fde8e8;font-weight:600"{% endif %}>
+<tr{% if seq.insert_region and f.start == seq.insert_region.start and f.end == seq.insert_region.end %} style="background:#fdf0ef;font-weight:600"{% endif %}>
 <td>{{ f.type }}</td><td>{{ f.label or '-' }}</td><td>{{ f.start }}..{{ f.end }}</td><td>{{ '+' if f.strand == 1 else ('-' if f.strand == -1 else '?') }}</td><td>{{ f.product or '-' }}</td></tr>
 {% endfor %}
 </tbody></table>
@@ -1635,7 +1503,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 {% endif %}
 </div>
 {% endfor %}
-{% if not p.sequences %}<p style="color:#999;font-size:12px;margin-top:10px;font-style:italic">No parseable sequence files attached to this entry.</p>{% endif %}
+{% if not p.sequences %}<p style="color:var(--fg3);font-size:12px;margin-top:10px">No parseable sequence files attached.</p>{% endif %}
 </div>
 </div>
 {% endfor %}
@@ -1648,8 +1516,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 </div>
 
 <div class="footer">
-<p>Generated from Plasmid Library Database on {{ export_date }}</p>
-<p>Your Institution</p>
+<p>Plasmid Library Database | {{ export_date }} | Your Institution</p>
 </div>
 
 <script>
@@ -1687,7 +1554,7 @@ if __name__ == '__main__':
     print(f"HTML Export: http://0.0.0.0:5001/export/html")
     print("=" * 60)
     print("🔐 ADMIN PASSWORD: admin123")
-    print("⚠️  CHANGE THIS in plasmid_server.py line 18!")
+    print("⚠️  CHANGE THIS in plasmid_server.py line 33!")
     print("=" * 60)
     print("✓ Audit trail: Enabled (all changes tracked)")
     print("✓ Auto-backup: Every Friday at 6:00 PM")
